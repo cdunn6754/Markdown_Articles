@@ -249,4 +249,146 @@ void Foam::sootHePsiThermo<BasicPsiThermo, MixtureType>::calculate()
 
 In order to calculate the density in accordance with equation 1 we need to determine the soot volume fraction field. Since this field is of interest in its own right another valid approach might be to create the field within the solver and then just pass it to this class to make the density calculation. Here I have made it a member of the class and just added an acess function for it.
 
-You can see the addition of the field on my [github](https://github.com/cdunn6754/OpenFOAM_5.x_Libraries), there is nothing too special about it. The function `updateSootVolume()` is taken with only minor modifications from the 'greyMeanSolidAbsoprtionEmission' radiation absorption/emission model. I thought it was a little complicated when I first saw it but I now think it is the best way to calculate volume fraction of a specie.
+You can see the addition of the field on my [github](https://github.com/cdunn6754/OpenFOAM_5.x_Libraries), there is nothing too special about it. For convenience I also added a soot density member variable, `sootDensity_`, that is hardcoded to $2000 \, [kg/m^3]$.
+
+The function `updateSootVolume()` is taken with only minor modifications from the 'greyMeanSolidAbsoprtionEmission' radiation absorption/emission model. I thought it was a little complicated when I first saw it but I now think it is the best way to calculate volume fraction of a specie. The basic idea is to first calculate something like the mixture specific volume
+
+$$
+  \nu_{mix}
+  =
+  \sum_{i}^{species} Y_i / \rho_i(T,P)
+$$
+
+Where $Y_i$ is a specie mass fraction and the specie density $\rho_i$ is calculated with the ideal gas law for the individual specie. We sum $Y_i / \rho_i$ which has units $[V_i / \text{unit mass}\,]$. Summing these yields the total volume of all gas species per unit mass ($\dot{=} \, V_{mix} / \text{unit mass}$). Then taking $\nu_{soot} = Y_{soot} / \rho_{soot}$ we can calculate the volume fraction as $\nu_{soot} / \nu_{mix}$ which has units of $V_{soot} / V_{mix}$. It is important here to use the known density of soot (2000 $[kg/m^3]$) rather than the ideal gas law prediction based on janaf thermodynamic data.
+
+A problem that remains in this approach is the question of what to do with the boundary values. The density field is a `volScalarField` and it therefore needs to have boundary conditions defined and we will in turn need boundary values for the soot volume fraction to calculate it. I think it should be possible to calculate boundary face valus since the `p_`, `T_` and `Y` fields are also `volScalarField`s but for now I am going to assume zero soot volume fraction at the boundaries (the last line in the function). At any rate if you do nothing the uninitialized boundary values will cause drastic density fluctuations and crash the simulation immediatly.
+
+
+```c++
+template<class BasicPsiThermo, class MixtureType>
+void Foam::sootHePsiThermo<BasicPsiThermo, MixtureType>::updateSootVolume()
+{
+
+    // Hardcoded soot density
+    scalar sootDensity(2000.0); // kg\m^3 from dasgupta thesis
+
+    // To be the sum overall species of [m^3_specie / kg_total]
+    scalarField specificVolumeSum =
+    scalarField(this->sootVolume_.size(), 0.0);
+
+    // As we iterate we will grab the SOOT specie index
+    label sootIdx(-1);
+
+    // Pointer to the mixture for this thermo
+    basicSpecieMixture& mixture_ = this->composition();
+
+    forAll(this->Y(), specieI)
+    {
+        const scalarField& Yi = mixture_.Y()[specieI];
+        const word specieName = mixture_.Y()[specieI].name();
+
+        if (specieName == "SOOT")
+        {
+            sootIdx = specieI;
+            specificVolumeSum += Yi/sootDensity;
+        }
+        else
+        {
+            // loop through cells for non-constant density
+            forAll(specificVolumeSum, celli)
+            {
+                specificVolumeSum[celli] += Yi[celli]/
+                    mixture_.rho(specieI, this->p_[celli], this->T_[celli]);
+            }
+        }
+
+    }// end loop through species
+
+    // now find and set the soot volume fraction as
+    // [V_soot/kg_total] / [V_total/kg_total]
+    this->sootVolume_.primitiveFieldRef() =
+        (this->Y()[sootIdx]/sootDensity) / (specificVolumeSum);
+
+    // Set this to 0 so that psi_* P_ is used for the boundary density field.
+    this->sootVolume_.boundaryFieldRef() = 0.0;
+}
+```
+
+#### 5. Create the `sootHePsiThermo::rho()` function
+
+Finally we are ready to actually write a new density calculation function. All of the work is already done and we can just write out the density function as described in equation 1 using the member variables we added earlier.
+
+```c++
+template<class BasicPsiThermo, class MixtureType>
+Foam::tmp<Foam::volScalarField>
+Foam::sootHePsiThermo<BasicPsiThermo, MixtureType>::rho() const
+{
+
+    return (1.0 - this->sootVolume_)*(this->p_*this->psi_) +
+        (this->sootVolume_) * this->sootDensity_;
+}
+```
+
+#### 6. Modifiy the solver to allow access to new class
+
+As mentioned above I thought this would be a good approach because the use of `sootHePsiThermo` rather than `hePsiThermo` is specified at runtime from the 'thermophysicalProperties' dictionary. That means that no solver modifications are necessary. Unfortunately I was mistaken because the thermo class within the solver is not created directly but instantiated within the combusition class. The combustion class then passes an upcasted reference to the solver, here is the code from the coalChemistryFoam createFields.H file
+
+```c++
+Info<< "Creating combustion model\n" << endl;
+
+autoPtr<combustionModels::psiCombustionModel> combustion
+(
+    combustionModels::psiCombustionModel::New(mesh)
+);
+
+psiReactionThermo& thermo = combustion->thermo();
+```
+
+Examining the thermo class in a little more detail we can see why this is possible. First here is the class again, as shown at the top of this document I have replace the specific template parameters used with more general names (those used for the template parameters in the source) for brevity.
+
+```c++
+hePsiThermo<BasicThermo,MixtureType>
+```
+
+You can look at the documentaton of the classes and discover that while `hePsiThermo` does not directly inherit from its template parameters, `BasicThermo` and `MixtureType`, it does inherit from `heThermo<BasicThermo,MixtureType>`. And `heThermo<BasicThermo,MixtureType>` inherits from both `BasicThermo` and `MixtureType`. So in the specific case where we `BasicThermo` is `psiReactionThermo` we know that `hePsiThermo` indirectly inherits from `psiReactionThermo` and it can therefore be upcast as implied in the code snippet above. I think they actually do a `dynamic_cast` on the original thermo reference within the combustion model to upcast and then just pass that member reference variable here.
+
+The problem with the upcast to `psiReactionThermo` is that all of the functions we just wrote in `hePsiThermo` are now inaccessible (you can't use a base class reference to access derived class functions when those functions they aren't present in the base class, and even then only if they are virtual functions). So the options are to either create a new combustion model too, with only the type of the thermo reference changed. Or to just use a downcast within the solver to change the reference to `psiReactionThermo` to a reference to `sootHePsiThermo`. The second option is used here.
+
+Here is my new version of the createFields file for the SootCoalFoam solver in which the thermo pointer is downcast using `dynamic_cast`
+
+```c++
+autoPtr<combustionModels::psiCombustionModel> combustion
+(
+    combustionModels::psiCombustionModel::New(mesh)
+);
+
+psiReactionThermo& baseThermo = combustion->thermo();
+
+
+// Downcast baseThermo to thermo
+// changes type from psiReactionThermo to sootHePsiThermo
+// which enables us to use the functions in sootHePsiThermo
+sootHePsiThermo<
+    psiReactionThermo,
+    SpecieMixture< reactingMixture< gasHThermoPhysics > >
+    > &thermo =
+    dynamic_cast<
+        sootHePsiThermo<
+            psiReactionThermo,
+            SpecieMixture<reactingMixture<gasHThermoPhysics > >
+            > &>
+                                        (baseThermo);
+```
+It is really messy, maybe some typdefs would be helpful to understand here but all we are doing is telling the pointer that it now points to type
+
+```c++
+hePsiThermo<psiReactionThermo,
+            SpecieMixture<reactingMixture<gasHthermoPhysics>>
+            >
+```
+
+rather than just `psiReactionThermo`
+
+I assume that the creators of OpenFOAM wrote it that way for a reason and I'm a little afraid that having the thermo pointer like that will cause a problem but so far in my testing I have not encountered any problems.
+
+You will need to link to the new library we created with the `sootHePsiThermo` class before compiling the solver. You will also need to include some header files for the additional classes needed in the downcast like `SpecieMixture`, `gasHthermoPhysics` and `reactingMixture`.
